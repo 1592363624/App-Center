@@ -16,15 +16,7 @@ jobs:
 
     steps:
       # -----------------------------
-      # Step 0: Checkout App-Center (本仓库)
-      # -----------------------------
-      - name: Checkout App-Center
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      # -----------------------------
-      # Step 0.5: 设置 Commit 状态为 Pending（为了在 GitHub UI 显示运行中）
+      # Step 0: 设置 Commit 状态为 Pending（为了在 GitHub UI 显示运行中）
       # -----------------------------
       - name: Set Commit Status Pending
         uses: actions/github-script@v6
@@ -39,6 +31,14 @@ jobs:
               description: 'Pack Private Repo is running...',
               context: 'Pack Private Repo'
             })
+
+      # -----------------------------
+      # Step 1: Checkout App-Center (本仓库)
+      # -----------------------------
+      - name: Checkout App-Center
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # -----------------------------
       # Step 1：配置 Git 凭证（拉私有仓库）
