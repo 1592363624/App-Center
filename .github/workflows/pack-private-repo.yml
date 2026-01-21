@@ -1,0 +1,442 @@
+name: Auto Pack Private Repo On Push
+
+on:
+  repository_dispatch:
+    types: [ pack_trigger ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+  statuses: write
+
+jobs:
+  pack-specific-repo:
+    runs-on: windows-latest
+
+    steps:
+      # -----------------------------
+      # Step 0: Checkout App-Center (本仓库)
+      # -----------------------------
+      - name: Checkout App-Center
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------
+      # Step 0.5: 设置 Commit 状态为 Pending（为了在 GitHub UI 显示运行中）
+      # -----------------------------
+      - name: Set Commit Status Pending
+        uses: actions/github-script@v6
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'pending',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: 'Pack Private Repo is running...',
+              context: 'Pack Private Repo'
+            })
+
+      # -----------------------------
+      # Step 1：配置 Git 凭证（拉私有仓库）
+      # -----------------------------
+      - name: Configure Git Credentials
+        shell: bash
+        run: |
+          git config --global credential.helper store
+          echo "https://${{ secrets.PRIVATE_REPO_TOKEN }}:@github.com" > ~/.git-credentials
+
+      # -----------------------------
+      # Step 2：克隆目标仓库
+      # -----------------------------
+      - name: Clone Triggered Private Repository
+        shell: bash
+        env:
+          REPO_NAME: ${{ github.event.client_payload.repo_name }}
+          REPO_BRANCH: ${{ github.event.client_payload.repo_branch }}
+          GITHUB_USER: ${{ github.event.client_payload.github_user }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          if [ -z "$REPO_NAME" ] || [ -z "$GITHUB_USER" ]; then
+            echo "❌ 缺少 repo_name / github_user"
+            exit 1
+          fi
+
+          REPO_URL="https://github.com/$GITHUB_USER/$REPO_NAME.git"
+          git clone "$REPO_URL" target-repo
+          cd target-repo
+
+          git checkout ${REPO_BRANCH:-main}
+          
+          # 获取当前 Commit SHA
+          CURRENT_SHA=$(git rev-parse HEAD)
+          echo "TARGET_SHA=$CURRENT_SHA" >> $GITHUB_ENV
+          
+          echo "🔎 正在计算精准更新日志..."
+          
+          # 尝试从 GitHub Release 历史中找到上一个版本的 Commit SHA
+          # 注意：需要 GITHUB_TOKEN 才能查询 Releases
+          PREV_SHA=""
+          
+          # 1. 列出该项目的历史 Release (过滤前缀)
+          # 格式: RepoName-Time-RunNum
+          # 我们只需要找到最近的一个
+          echo "Searching for previous release of $REPO_NAME..."
+          # 使用 || true 防止因为找不到 Release 而导致脚本直接报错退出
+          LAST_TAG=$(gh release list --repo "${{ github.repository }}" --exclude-drafts --exclude-pre-releases --limit 100 | grep "^$REPO_NAME-" | head -n 1 | awk '{print $1}' || true)
+          
+          if [ -n "$LAST_TAG" ]; then
+            echo "Found previous tag: $LAST_TAG"
+            # 2. 获取 Release Body
+            BODY=$(gh release view "$LAST_TAG" --repo "${{ github.repository }}" --json body -q .body)
+            # 3. 提取 "Commit: xxx"
+            PREV_SHA=$(echo "$BODY" | grep "Commit: " | awk '{print $2}' | tr -d '\r')
+          fi
+          
+          CHANGELOG=""
+          
+          if [ -n "$PREV_SHA" ]; then
+            echo "Found previous commit SHA: $PREV_SHA"
+            # 检查该 SHA 是否存在于当前历史中
+            if git merge-base --is-ancestor "$PREV_SHA" HEAD; then
+               echo "✅ Calculating changes from $PREV_SHA to HEAD"
+               CHANGELOG=$(git log --no-merges --pretty=format:"- %s" "$PREV_SHA..HEAD")
+            else
+               echo "⚠ Previous commit not found in history (force push?), falling back to last 5."
+               CHANGELOG=$(git log -5 --no-merges --pretty=format:"- %s")
+            fi
+          else
+            echo "⚠ No previous release/commit found (first run?), showing last 5 commits."
+            CHANGELOG=$(git log -5 --no-merges --pretty=format:"- %s")
+          fi
+          
+          # 如果 Changelog 为空 (没有新提交)，显示最后一条
+          if [ -z "$CHANGELOG" ]; then
+             CHANGELOG=$(git log -1 --pretty=format:"- %s (Rebuild)")
+          fi
+
+          echo "COMMIT_MSG<<EOF" >> $GITHUB_ENV
+          echo "$CHANGELOG" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      # -----------------------------
+      # Step 3：安装依赖（自动识别）
+      # -----------------------------
+      - name: Install Dependencies
+        working-directory: ./target-repo
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "package.json" ]; then
+            npm install
+          elif [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          elif [ -f "pom.xml" ]; then
+            echo "Maven 项目，跳过依赖安装"
+          elif ls *.csproj 1> /dev/null 2>&1 || ls *.sln 1> /dev/null 2>&1; then
+            echo ".NET 项目，使用 dotnet restore"
+            dotnet restore
+          fi
+
+      # -----------------------------
+      # Step 4：构建项目
+      # -----------------------------
+      - name: Build Project
+        working-directory: ./target-repo
+        shell: bash
+        run: |
+          set -e
+
+          # 🧹 Clean potential stale artifacts before build
+          rm -rf publish dist target build out bin release
+
+          if [ -f "package.json" ]; then
+            npm install # Re-ensure install if needed, but Step 3 did it.
+            npm run build
+            # Attempt to detect output directory
+            if [ -d "dist" ]; then echo "BUILD_OUTPUT_DIR=dist" >> $GITHUB_ENV; fi
+            if [ -d "build" ]; then echo "BUILD_OUTPUT_DIR=build" >> $GITHUB_ENV; fi
+          elif [ -f "pom.xml" ]; then
+            mvn package -DskipTests
+            echo "BUILD_OUTPUT_DIR=target" >> $GITHUB_ENV
+          elif [ -f "requirements.txt" ] && [ -f "main.py" ]; then
+            pyinstaller --onefile main.py
+            echo "BUILD_OUTPUT_DIR=dist" >> $GITHUB_ENV
+          elif ls *.csproj 1> /dev/null 2>&1 || ls *.sln 1> /dev/null 2>&1; then
+            echo "🚀 发现 .NET 项目，开始逐个构建..."
+          
+            # 创建临时目录存放原始发布文件
+            mkdir -p publish_raw
+            mkdir -p publish_output
+
+            # 遍历所有 .csproj 文件 (排除 Tests 测试项目)
+            find . -name "*.csproj" | grep -v "Test" | while read proj; do
+              PROJ_NAME=$(basename "$proj" .csproj)
+              echo "👉 正在构建项目: $PROJ_NAME"
+          
+              # 发布到独立目录，防止混淆
+              dotnet publish "$proj" -c Release -r win-x64 --self-contained true \
+                -p:PublishSingleFile=true \
+                -o "publish_raw/$PROJ_NAME"
+
+              # 打包成独立 Zip
+              echo "📦 正在打包: $PROJ_NAME.zip"
+              if command -v 7z > /dev/null; then
+                7z a -tzip "publish_output/$PROJ_NAME.zip" "./publish_raw/$PROJ_NAME/*"
+              else
+                # Fallback to PowerShell for zipping if 7z is missing
+                powershell -Command "Compress-Archive -Path 'publish_raw/$PROJ_NAME/*' -DestinationPath 'publish_output/$PROJ_NAME.zip'"
+              fi
+            done
+          
+            echo "BUILD_OUTPUT_DIR=publish_output" >> $GITHUB_ENV
+          else
+            echo "⚠ 未识别构建类型，跳过"
+          fi
+
+      # -----------------------------
+      # Step 5：收集构建产物
+      # -----------------------------
+      - name: Collect Build Artifacts
+        id: collect
+        shell: bash
+        run: |
+          set -e
+
+          OUT="$GITHUB_WORKSPACE/build-artifacts"
+          mkdir -p "$OUT"
+
+          if [ -n "$BUILD_OUTPUT_DIR" ]; then
+            echo "✅ 使用明确的构建输出目录: $BUILD_OUTPUT_DIR"
+            if [ -d "./target-repo/$BUILD_OUTPUT_DIR" ]; then
+              cp -r "./target-repo/$BUILD_OUTPUT_DIR"/* "$OUT/" || true
+            fi
+          else
+            echo "⚠ 未检测到明确输出目录，尝试自动扫描..."
+            # Removed 'bin' to avoid intermediate files
+            for dir in publish dist target build out release; do
+              if [ -d "./target-repo/$dir" ]; then
+                cp -r "./target-repo/$dir"/* "$OUT/" || true
+              fi
+            done
+
+            find ./target-repo -maxdepth 1 -type f \
+              \( -name "*.exe" -o -name "*.zip" -o -name "*.jar" -o -name "*.apk" -o -name "*.dmg" \) \
+              -exec cp {} "$OUT/" \;
+          fi
+
+          if [ "$(ls -A "$OUT")" ]; then
+            echo "has_artifacts=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_artifacts=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Ensure Artifacts Exist
+        if: steps.collect.outputs.has_artifacts != 'true'
+        run: |
+          echo "::error::未找到任何构建产物"
+          exit 1
+
+      # -----------------------------
+      # Step 6：Release 资产去重（核心修复点）
+      # -----------------------------
+      - name: Deduplicate Release Assets
+        shell: pwsh
+        run: |
+          $src = "build-artifacts"
+          $dst = "release-assets"
+
+          New-Item $dst -ItemType Directory -Force | Out-Null
+          $map = @{}
+
+          Get-ChildItem $src -Recurse -File | Where-Object {
+            $_.Extension -ne ".pdb"
+          } | ForEach-Object {
+            if (-not $map.ContainsKey($_.Name)) {
+              $map[$_.Name] = $_
+            }
+          }
+
+          foreach ($file in $map.Values) {
+            Copy-Item $file.FullName $dst
+          }
+
+          Write-Host "最终上传文件列表："
+          Get-ChildItem $dst
+
+      # -----------------------------
+      # Step 7：生成 Tag
+      # -----------------------------
+      - name: Generate Release Tag
+        id: tag
+        shell: bash
+        run: |
+          # 修正时区：GitHub Actions 默认为 UTC，这里手动调整为 UTC+8 (北京时间)
+          TS=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M%S')-${GITHUB_RUN_NUMBER}
+          NAME="${{ github.event.client_payload.repo_name }}"
+          [ -z "$NAME" ] && NAME="manual-build"
+          echo "tag_name=${NAME}-${TS}" >> $GITHUB_OUTPUT
+
+      # -----------------------------
+      # Step 8：创建 Release（不会再 404）
+      # -----------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: ${{ steps.tag.outputs.tag_name }}
+          body: |
+            Source Repo: ${{ github.event.client_payload.github_user }}/${{ github.event.client_payload.repo_name }}
+            Branch: ${{ github.event.client_payload.repo_branch }}
+            Commit: ${{ env.TARGET_SHA }}
+            
+            ### Changelog
+            ${{ env.COMMIT_MSG }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------
+      # Step 10: 更新 README.md (自动生成下载列表)
+      # -----------------------------
+      - name: Update README with Latest Release
+        if: success()
+        shell: python
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag_name }}
+          REPO_NAME: ${{ github.event.client_payload.repo_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          import os
+          import re
+          import datetime
+
+          # 配置
+          readme_path = "README.md"
+          marker_start = "<!-- RELEASE_TABLE_START -->"
+          marker_end = "<!-- RELEASE_TABLE_END -->"
+          header = "| 项目 (Project) | 版本 (Tag) | 更新时间 (Time) | 更新日志 (Log) | 下载 (Download) |\n| :--- | :--- | :--- | :--- | :--- |"
+          
+          # 获取输入
+          tag_name = os.environ.get("TAG_NAME", "Unknown")
+          repo_name = os.environ.get("REPO_NAME", "Unknown")
+          commit_msg = os.environ.get("COMMIT_MSG", "Update")
+          current_repo = os.environ.get("GITHUB_REPOSITORY")
+          
+          # 北京时间
+          utc_now = datetime.datetime.utcnow()
+          beijing_now = utc_now + datetime.timedelta(hours=8)
+          time_str = beijing_now.strftime("%Y-%m-%d %H:%M")
+
+          # 扫描产物
+          assets_dir = "release-assets"
+          new_rows = {}
+          
+          if os.path.exists(assets_dir):
+              for f in os.listdir(assets_dir):
+                  if not f.endswith(".zip"): continue
+          
+                  # 项目名 (去后缀)
+                  proj_name = f[:-4]
+                  download_url = f"https://github.com/{current_repo}/releases/download/{tag_name}/{f}"
+          
+                  # 清理日志中的特殊字符，并处理多行
+                  lines = [line.strip() for line in commit_msg.split('\n') if line.strip()]
+                  # 限制最多显示 5 行，防止表格过高
+                  if len(lines) > 5:
+                      lines = lines[:5] + ["..."]
+          
+                  # 转义管道符并用 <br> 连接
+                  safe_msg = "<br>".join([line.replace('|', '\|') for line in lines])
+          
+                  # 构造行
+                  row = f"| {proj_name} | {tag_name} | {time_str} | {safe_msg} | [点击下载]({download_url}) |"
+                  new_rows[proj_name] = row
+
+          if not new_rows:
+              print("No zip assets found, skipping README update.")
+              exit(0)
+
+          # 读取 README
+          if not os.path.exists(readme_path):
+              content = f"# App Store\n\n## 📦 最新发布 (Latest Releases)\n{marker_start}\n{marker_end}\n"
+          else:
+              with open(readme_path, "r", encoding="utf-8") as f:
+                  content = f.read()
+          
+              # 确保有 Marker
+              if marker_start not in content:
+                  content += f"\n\n## 📦 最新发布 (Latest Releases)\n{marker_start}\n{marker_end}\n"
+
+          # 提取并解析旧表格（保留其他项目的记录）
+          pattern = re.compile(f"{re.escape(marker_start)}(.*?){re.escape(marker_end)}", re.DOTALL)
+          match = pattern.search(content)
+          
+          final_rows = {}
+          
+          if match:
+              old_table_block = match.group(1).strip()
+              lines = old_table_block.split('\n')
+              for line in lines:
+                  if not line.strip().startswith("|") or "---" in line or "Project" in line:
+                      continue
+          
+                  parts = [p.strip() for p in line.split('|')]
+                  if len(parts) >= 2:
+                      p_name = parts[1]
+                      if p_name:
+                          final_rows[p_name] = line
+
+          # 更新当前项目的行
+          for name, row in new_rows.items():
+              final_rows[name] = row
+              print(f"Updated entry for: {name}")
+
+          # 重新生成表格
+          sorted_rows = [final_rows[k] for k in sorted(final_rows.keys())]
+          new_table = f"\n{header}\n" + "\n".join(sorted_rows) + "\n"
+          
+          # 替换内容
+          new_content = pattern.sub(f"{marker_start}{new_table}{marker_end}", content)
+          
+          with open(readme_path, "w", encoding="utf-8") as f:
+              f.write(new_content)
+
+      # -----------------------------
+      # Step 11: 提交 README 变更
+      # -----------------------------
+      - name: Commit and Push README
+        if: success()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: auto update readme for release ${{ steps.tag.outputs.tag_name }}" || echo "No changes to commit"
+          git push origin main
+
+      # -----------------------------
+      # Step 12: 更新 Commit 状态（成功或失败）
+      # -----------------------------
+      - name: Update Commit Status
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const state = '${{ job.status }}' === 'success' ? 'success' : 'failure';
+            const description = '${{ job.status }}' === 'success' ? 'Build succeeded' : 'Build failed';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: state,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: description,
+              context: 'Pack Private Repo'
+            });
