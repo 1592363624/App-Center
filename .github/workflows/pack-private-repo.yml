@@ -181,7 +181,7 @@ jobs:
               echo "👉 正在构建项目: $PROJ_NAME"
           
               # 发布到独立目录，防止混淆
-              dotnet publish "$proj" -c Release -r win-x64 --self-contained true \
+              dotnet publish "$proj" -c Release -r win-x64 --self-contained false \
                 -p:PublishSingleFile=true \
                 -o "publish_raw/$PROJ_NAME"
 
