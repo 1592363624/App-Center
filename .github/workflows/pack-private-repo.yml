@@ -125,6 +125,45 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
       # -----------------------------
+      # Step 2.5：配置缓存（加速构建）
+      # -----------------------------
+      - name: Cache NuGet Packages
+        if: hashFiles('target-repo/**/*.csproj') != '' || hashFiles('target-repo/**/*.sln') != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('target-repo/**/*.csproj', 'target-repo/**/*.sln') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Cache NPM Packages
+        if: hashFiles('target-repo/**/package.json') != ''
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Roaming\npm-cache
+          key: ${{ runner.os }}-npm-${{ hashFiles('target-repo/**/package-lock.json', 'target-repo/**/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Cache Pip Packages
+        if: hashFiles('target-repo/**/requirements.txt') != ''
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('target-repo/**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Cache Maven Packages
+        if: hashFiles('target-repo/**/pom.xml') != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('target-repo/**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # -----------------------------
       # Step 3：安装依赖（自动识别）
       # -----------------------------
       - name: Install Dependencies
@@ -181,9 +220,7 @@ jobs:
               echo "👉 正在构建项目: $PROJ_NAME"
           
               # 发布到独立目录，防止混淆
-              dotnet publish "$proj" -c Release -r win-x64 --self-contained false \
-                -p:PublishSingleFile=true \
-                -o "publish_raw/$PROJ_NAME"
+              dotnet publish "$proj" -c Release -o "publish_raw/$PROJ_NAME"
 
               # 打包成独立 Zip
               echo "📦 正在打包: $PROJ_NAME.zip"
