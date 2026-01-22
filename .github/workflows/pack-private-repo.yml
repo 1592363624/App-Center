@@ -312,13 +312,16 @@ jobs:
       # -----------------------------
       - name: Generate Release Tag
         id: tag
-        shell: bash
+        shell: pwsh
         run: |
           # 修正时区：GitHub Actions 默认为 UTC，这里手动调整为 UTC+8 (北京时间)
-          TS=$(TZ='Asia/Shanghai' date +'%Y%m%d-%H%M%S')-${GITHUB_RUN_NUMBER}
-          NAME="${{ github.event.client_payload.repo_name }}"
-          [ -z "$NAME" ] && NAME="manual-build"
-          echo "tag_name=${NAME}-${TS}" >> $GITHUB_OUTPUT
+          $ts = (Get-Date).ToUniversalTime().AddHours(8).ToString("yyyyMMdd-HHmmss")
+          $ts = "$ts-$env:GITHUB_RUN_NUMBER"
+
+          $name = "${{ github.event.client_payload.repo_name }}"
+          if ([string]::IsNullOrWhiteSpace($name)) { $name = "manual-build" }
+
+          "tag_name=$name-$ts" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       # -----------------------------
       # Step 8：创建 Release（不会再 404）
