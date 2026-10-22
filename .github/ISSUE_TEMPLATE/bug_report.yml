@@ -9,9 +9,9 @@ body:
       label: 反馈软件（必选）
       description: 请选择你遇到问题的软件
       options:
-        - CT_Translation
-        - SteamAccountManager
         - 使魔大战
+        - SteamAccountManager
+        - CT_Translation
     validations:
       required: true
 
