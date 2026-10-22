@@ -1,0 +1,46 @@
+name: 功能建议 (Feature Request)
+description: 为软件提出新功能或改进建议
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提出你的建议！请先选择你建议对应的软件。
+
+  - type: dropdown
+    id: software
+    attributes:
+      label: 反馈软件（必选）
+      description: 请选择你建议针对的软件
+      options:
+        - CT_Translation
+        - SteamAccountManager
+        - 使魔大战
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: 建议内容
+      description: 请详细描述你希望新增或改进的功能
+      placeholder: 例如：希望支持批量导出翻译结果
+    validations:
+      required: true
+
+  - type: textarea
+    id: reason
+    attributes:
+      label: 使用场景 / 原因
+      description: 为什么需要这个功能，能解决什么问题
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充说明
+      description: 其他参考信息、截图或类似功能示例
+    validations:
+      required: false
